@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Provincial Survey System</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <!-- Firebase SDKs (Standard Web Import) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, query, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // ==========================================
+        //  🚀 DEPLOYMENT CONFIGURATION
+        // ==========================================
+        // 1. Go to console.firebase.google.com
+        // 2. Create a project > Add Web App
+        // 3. Copy the config and paste it below to replace the placeholder.
+        
+        const firebaseConfig = {
+            apiKey: "YOUR_API_KEY_HERE",
+            authDomain: "YOUR_PROJECT.firebaseapp.com",
+            projectId: "YOUR_PROJECT_ID",
+            storageBucket: "YOUR_PROJECT.appspot.com",
+            messagingSenderId: "...",
+            appId: "..."
+        };
+
+        // ==========================================
+        //  APP LOGIC START
+        // ==========================================
+
+        let app, auth, db;
+        let isConfigured = false;
+        let isDemoMode = false;
+
+        // Initialize Firebase
+        try {
+            if (firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY_HERE") {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                isConfigured = true;
+            } else {
+                console.warn("No Firebase Config found. Running in Demo Mode.");
+                isDemoMode = true;
+            }
+        } catch (e) {
+            console.error("Firebase init error:", e);
+            isDemoMode = true;
+        }
+
+        // --- State ---
+        let currentUser = null;
+        let surveys = [];
+        let viewState = 'DASHBOARD'; 
+        let currentSurveyId = null;
+        let currentSurveyType = 'CONSUMER'; 
+        let isDataLoaded = false;
+        
+        const PROVINCES = [
+            { code: 'PP', name: 'Phnom Penh' },
+            { code: 'KD', name: 'Kandal' },
+            { code: 'BTB', name: 'Battambang', target: true },
+            { code: 'SR', name: 'Siem Reap', target: true },
+            { code: 'PV', name: 'Prey Veng', target: true },
+            { code: 'KC', name: 'Kampong Cham', target: true },
+            { code: 'KP', name: 'Kampot', target: true },
+        ];
+        const TARGET_PROVINCES = PROVINCES.filter(p => p.target);
+
+        // --- Helper: ID Generation ---
+        function generateId(provinceName, type) {
+            const prov = PROVINCES.find(p => p.name === provinceName);
+            if (!prov) return '---';
+            const code = prov.code;
+            const prefix = type === 'RETAILER' ? `R-${code}` : code;
+            
+            const numbers = surveys
+                .filter(s => s.generatedId && s.generatedId.startsWith(prefix))
+                .map(s => parseInt(s.generatedId.replace(prefix, ''), 10))
+                .sort((a, b) => a - b);
+
+            let nextNum = 1;
+            for (let i = 0; i < numbers.length; i++) {
+                if (numbers[i] === nextNum) nextNum++;
+                else if (numbers[i] > nextNum) break; 
+            }
+            return `${prefix}${String(nextNum).padStart(3, '0')}`;
+        }
+
+        // --- Auth & Init ---
+        async function initApp() {
+            renderDashboardShell();
+
+            // Show Setup Modal if keys are missing
+            if (isDemoMode) {
+                document.getElementById('setup-modal').classList.remove('hidden');
+                currentUser = { uid: 'local_user' };
+                setupRealtimeListener();
+                return;
+            }
+
+            // Standard Anonymous Auth
+            try {
+                await signInAnonymously(auth);
+            } catch (e) { 
+                console.error("Auth Error:", e);
+                alert("Authentication failed. Check console for details.");
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) { 
+                    currentUser = user; 
+                    setupRealtimeListener(); 
+                }
+            });
+        }
+
+        function setupRealtimeListener() {
+            if (isDemoMode) {
+                const stored = localStorage.getItem('survey_data_prod');
+                try { surveys = stored ? JSON.parse(stored) : []; } catch(e) { surveys = []; }
+                isDataLoaded = true;
+                if(viewState === 'DASHBOARD') renderDashboardData();
+                return;
+            }
+
+            // PROD PATH: Just 'surveys' collection
+            const q = query(collection(db, 'surveys'));
+            
+            onSnapshot(q, (snapshot) => {
+                surveys = snapshot.docs.map(doc => ({ docId: doc.id, ...doc.data() }));
+                surveys.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+                isDataLoaded = true;
+                if(viewState === 'DASHBOARD') renderDashboardData();
+            }, (err) => {
+                console.error("Database Error:", err);
+                // Silent fail or alert if needed
+            });
+        }
+
+        // --- Navigation & UI ---
+        window.showTypeSelection = function() {
+            document.getElementById('type-modal').classList.remove('hidden');
+        }
+
+        window.startNewSurvey = function(type) {
+            document.getElementById('type-modal').classList.add('hidden');
+            currentSurveyType = type;
+            openForm(null, false);
+        }
+
+        window.openForm = function(docId = null, readOnly = false) {
+            viewState = 'FORM';
+            currentSurveyId = docId;
+            
+            document.getElementById('dashboard-view').classList.add('hidden');
+            const consumerForm = document.getElementById('consumer-form');
+            const retailerForm = document.getElementById('retailer-form');
+            
+            if (docId) {
+                const s = surveys.find(x => x.docId === docId);
+                currentSurveyType = s.type || 'CONSUMER';
+            }
+
+            let data = {};
+            if (docId) {
+                data = surveys.find(s => s.docId === docId) || {};
+            }
+
+            if (currentSurveyType === 'RETAILER') {
+                consumerForm.classList.add('hidden');
+                retailerForm.classList.remove('hidden');
+                resetRetailerForm(); 
+                populateRetailerForm(data, readOnly);
+            } else {
+                retailerForm.classList.add('hidden');
+                consumerForm.classList.remove('hidden');
+                resetConsumerForm();
+                populateConsumerForm(data, readOnly);
+            }
+
+            document.getElementById('form-view').classList.remove('hidden');
+            window.scrollTo(0, 0);
+
+            const title = currentSurveyType === 'RETAILER' ? 'Retailer Survey' : 'Consumer Survey';
+            document.getElementById('form-title').textContent = docId ? (readOnly ? 'View: ' + title : 'Edit: ' + title) : 'New: ' + title;
+            document.getElementById('btn-save').style.display = readOnly ? 'none' : 'flex';
+            
+            const idEl = document.getElementById('display-id');
+            idEl.textContent = (!docId && !readOnly) ? '---' : (data.generatedId || '---');
+
+            const formId = currentSurveyType === 'RETAILER' ? 'retailer-form-content' : 'consumer-form-content';
+            const inputs = document.getElementById(formId).querySelectorAll('input, select, textarea, button.add-row-btn');
+            inputs.forEach(el => el.disabled = readOnly);
+        }
+
+        window.renderDashboardData = function() {
+            if (!isDataLoaded) return;
+            viewState = 'DASHBOARD';
+            document.getElementById('dashboard-view').classList.remove('hidden');
+            document.getElementById('form-view').classList.add('hidden');
+            document.getElementById('total-surveys').textContent = surveys.length;
+            
+            const stats = {};
+            TARGET_PROVINCES.forEach(p => stats[p.name] = 0);
+            surveys.forEach(s => { if (stats[s.province] !== undefined) stats[s.province]++; });
+
+            const boxes = document.getElementById('province-boxes');
+            boxes.innerHTML = '';
+            TARGET_PROVINCES.forEach(prov => {
+                const count = stats[prov.name] || 0;
+                boxes.innerHTML += `
+                    <div onclick="filterTableByProvince('${prov.name}')" class="cursor-pointer bg-white p-4 rounded-xl shadow-sm border-l-4 border-blue-500 hover:shadow-md transition relative overflow-hidden group">
+                        <div class="flex justify-between">
+                            <div><span class="text-xs font-bold text-gray-400 uppercase">${prov.code}</span><h3 class="font-bold text-gray-700 truncate">${prov.name}</h3></div>
+                            <i class="fas fa-map-marker-alt text-blue-100 group-hover:text-blue-500 transition"></i>
+                        </div>
+                        <div class="mt-2"><span class="text-3xl font-bold text-gray-800">${count}</span></div>
+                    </div>`;
+            });
+            renderTable(surveys);
+        }
+
+        function renderTable(data) {
+            const tbody = document.getElementById('survey-table-body');
+            tbody.innerHTML = '';
+            if (!data.length) { tbody.innerHTML = '<tr><td colspan="6" class="p-8 text-center text-gray-500">No data found.</td></tr>'; return; }
+            
+            data.forEach(s => {
+                const date = s.createdAt ? (s.createdAt.seconds ? new Date(s.createdAt.seconds*1000) : new Date(s.createdAt)).toLocaleDateString() : '-';
+                const typeBadge = s.type === 'RETAILER' 
+                    ? '<span class="bg-purple-100 text-purple-800 text-xs px-2 py-1 rounded font-bold">Retailer</span>'
+                    : '<span class="bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded font-bold">Consumer</span>';
+                
+                tbody.innerHTML += `
+                    <tr class="hover:bg-gray-50 border-b border-gray-100">
+                        <td class="p-3 font-mono font-medium text-blue-600">${s.generatedId || '---'}</td>
+                        <td class="p-3">${typeBadge}</td>
+                        <td class="p-3"><span class="px-2 py-1 bg-gray-100 rounded text-xs">${s.province}</span></td>
+                        <td class="p-3 text-sm text-gray-700">${s.interviewer || s.retailerName || '-'}</td>
+                        <td class="p-3 text-sm text-gray-500">${date}</td>
+                        <td class="p-3 flex gap-2">
+                            <button onclick="openForm('${s.docId}', true)" class="text-gray-400 hover:text-blue-600"><i class="fas fa-eye"></i></button>
+                            <button onclick="openForm('${s.docId}', false)" class="text-gray-400 hover:text-green-600"><i class="fas fa-edit"></i></button>
+                            <button onclick="deleteSurvey('${s.docId}')" class="text-gray-400 hover:text-red-600"><i class="fas fa-trash"></i></button>
+                        </td>
+                    </tr>`;
+            });
+        }
+
+        // --- Export Functions ---
+        window.toggleExportMenu = function() {
+            document.getElementById('export-menu').classList.toggle('hidden');
+        }
+
+        window.exportData = function(type) {
+            if (!surveys.length) return alert("No data");
+            
+            let dataToExport = [];
+            let filename = "";
+
+            if (type === 'SUMMARY') {
+                const stats = {};
+                TARGET_PROVINCES.forEach(p => stats[p.name] = { consumer: 0, retailer: 0 });
+                
+                surveys.forEach(s => {
+                    if (stats[s.province]) {
+                        if (s.type === 'RETAILER') stats[s.province].retailer++;
+                        else stats[s.province].consumer++;
+                    }
+                });
+
+                dataToExport = TARGET_PROVINCES.map(p => ({
+                    Province: p.name,
+                    Consumer_Surveys: stats[p.name].consumer,
+                    Retailer_Surveys: stats[p.name].retailer,
+                    Total: stats[p.name].consumer + stats[p.name].retailer
+                }));
+                filename = "Province_Summary_Report.csv";
+
+            } else {
+                const filterType = type; 
+                const filtered = surveys.filter(s => (s.type || 'CONSUMER') === filterType);
+                
+                if(filtered.length === 0) return alert("No " + filterType + " surveys found.");
+
+                dataToExport = filtered.map(s => {
+                    const flat = {
+                        ID: s.generatedId,
+                        Province: s.province,
+                        Date: s.createdAt ? new Date(s.createdAt.seconds*1000 || s.createdAt).toISOString().split('T')[0] : '',
+                        Interviewer_or_Store: s.interviewer || s.retailerName || '',
+                    };
+
+                    for (const [key, value] of Object.entries(s)) {
+                        if (typeof value !== 'object') flat[key] = value;
+                    }
+
+                    // Flatten Tables
+                    if (s.topOfMindBrands) s.topOfMindBrands.forEach((r, i) => flat[`Brand_Mentions_${i+1}`] = `${r.category}: ${r.brands}`);
+                    if (s.topProducts) s.topProducts.forEach((r, i) => flat[`Top_Product_${i+1}`] = `${r.category} - ${r.brand} (${r.flavor})`);
+                    if (s.otherCategoriesTable) s.otherCategoriesTable.forEach((r, i) => {
+                        flat[`Stock_${r.category}_Qty`] = r.qty;
+                        flat[`Stock_${r.category}_Unit`] = r.unit;
+                        flat[`Stock_${r.category}_BuyPrice`] = r.price;
+                    });
+                    if (s.facingsList) s.facingsList.forEach(r => flat[`Facing_${r.brand}`] = r.count);
+                    
+                    return flat;
+                });
+                filename = filterType + "_Data_Export.csv";
+            }
+
+            const headers = Object.keys(dataToExport[0]).join(',');
+            const rows = dataToExport.map(row => Object.values(row).map(v => `"${v}"`).join(','));
+            const csv = [headers, ...rows].join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.click();
+            document.getElementById('export-menu').classList.add('hidden');
+        }
+
+        // --- CONSUMER FORM LOGIC ---
+        function resetConsumerForm() {
+            document.getElementById('consumer-form-content').reset();
+            document.getElementById('top-brands-body').innerHTML = '';
+            document.getElementById('top-products-body').innerHTML = '';
+        }
+        function populateConsumerForm(data, readOnly) {
+            setVal('province', data.province);
+            setVal('interviewer', data.interviewer);
+            checkRadio('generation', data.generation);
+            checkRadio('purchasedPast3Months', data.purchasedPast3Months);
+            (data.topOfMindBrands || []).forEach(r => addRow('top-brands-body', r, readOnly));
+            (data.topProducts || []).forEach(r => addRow('top-products-body', r, readOnly));
+        }
+
+        // --- RETAILER FORM LOGIC --- 
+        function resetRetailerForm() {
+            document.getElementById('retailer-form-content').reset();
+            const cats = ['Potato chips', 'Puff snacks', 'Jerky/Meat', 'Dried Fruit', 'Nuts & Seeds', 'Pickled', 'Other'];
+            const tbody = document.getElementById('other-cats-body');
+            tbody.innerHTML = '';
+            cats.forEach(c => addOtherCatRow(c, {}, false));
+
+            const tbody2 = document.getElementById('top-sellers-body');
+            tbody2.innerHTML = '';
+            ['Top 1', 'Top 2', 'Top 3'].forEach(r => addBestSellerRow(r, {}, false));
+
+            const tbody3 = document.getElementById('facings-body');
+            tbody3.innerHTML = '';
+            ['Lays', 'Swing', 'Tasto', 'LyLy', 'Tenta', 'Hanami', 'Other'].forEach(b => addFacingRow(b, {}, false));
+
+            const tbody4 = document.getElementById('support-body');
+            tbody4.innerHTML = '';
+            for(let i=1; i<=6; i++) addSupportRow(i, {}, false);
+        }
+
+        function populateRetailerForm(data, readOnly) {
+            setVal('r_province', data.province);
+            setVal('retailerName', data.retailerName);
+            setVal('storeType', data.storeType);
+            setVal('pinLocation', data.pinLocation);
+            checkRadio('isOwner', data.isOwner);
+            checkRadio('packSize', data.packSize);
+            checkRadio('profitMargin', data.profitMargin);
+            setVal('turnover', data.turnover);
+            setVal('newFlavorRequest', data.newFlavorRequest);
+            
+            const tbody = document.getElementById('other-cats-body');
+            tbody.innerHTML = '';
+            (data.otherCategoriesTable || []).forEach(r => addOtherCatRow(r.category, r, readOnly));
+
+            const tbody2 = document.getElementById('top-sellers-body');
+            tbody2.innerHTML = '';
+            (data.topBestSellersTable || []).forEach(r => addBestSellerRow(r.rank, r, readOnly));
+
+            const tbody3 = document.getElementById('facings-body');
+            tbody3.innerHTML = '';
+            (data.facingsList || []).forEach(r => addFacingRow(r.brand, r, readOnly));
+
+            const tbody4 = document.getElementById('support-body');
+            tbody4.innerHTML = '';
+            (data.supportTable || []).forEach((r, i) => addSupportRow(i+1, r, readOnly));
+            
+            checkBoxes('stockChallenges', data.stockChallenges);
+            checkBoxes('customerReasons', data.customerReasons);
+            checkBoxes('improvements', data.improvements);
+        }
+
+        // --- Shared Save ---
+        window.saveSurvey = async function(e) {
+            e.preventDefault();
+            if (!currentUser) return alert("Error: Not logged in.");
+
+            let surveyData = {};
+            const common = {
+                userId: currentUser.uid,
+                updatedAt: isDemoMode ? new Date().toISOString() : serverTimestamp()
+            };
+
+            if (currentSurveyType === 'CONSUMER') {
+                const form = document.getElementById('consumer-form-content');
+                const fd = new FormData(form);
+                surveyData = {
+                    type: 'CONSUMER',
+                    province: fd.get('province'),
+                    interviewer: fd.get('interviewer'),
+                    generatedId: currentSurveyId ? document.getElementById('display-id').textContent : generateId(fd.get('province'), 'CONSUMER'),
+                    topOfMindBrands: harvestTable('top-brands-body', ['category', 'brands']),
+                    topProducts: harvestTable('top-products-body', ['rank', 'category', 'brand', 'flavor', 'price']),
+                    generation: fd.get('generation'),
+                    purchasedPast3Months: fd.get('purchasedPast3Months'),
+                    ...common
+                };
+            } else {
+                const form = document.getElementById('retailer-form-content');
+                const fd = new FormData(form);
+                surveyData = {
+                    type: 'RETAILER',
+                    province: fd.get('r_province'),
+                    retailerName: fd.get('retailerName'),
+                    storeType: fd.get('storeType'),
+                    pinLocation: fd.get('pinLocation'),
+                    isOwner: fd.get('isOwner'),
+                    generatedId: currentSurveyId ? document.getElementById('display-id').textContent : generateId(fd.get('r_province'), 'RETAILER'),
+                    
+                    otherCategoriesTable: harvestRetailerTable('other-cats-body', ['category', 'qty', 'unit', 'price', 'freq', 'retailPrice', 'source']),
+                    topBestSellersTable: harvestRetailerTable('top-sellers-body', ['rank', 'cat', 'brand', 'flavor', 'p18', 'p32', 'p50']),
+                    facingsList: harvestRetailerTable('facings-body', ['brand', 'count']),
+                    supportTable: harvestRetailerTable('support-body', ['brand', 's_sample', 's_promo', 's_test', 's_pop', 's_rack']),
+                    
+                    packSize: fd.get('packSize'),
+                    profitMargin: fd.get('profitMargin'),
+                    turnover: fd.get('turnover'),
+                    customerReasons: getCB('customerReasons'),
+                    stockChallenges: getCB('stockChallenges'),
+                    newFlavorRequest: fd.get('newFlavorRequest'),
+                    improvements: getCB('improvements'),
+                    
+                    ...common
+                };
+            }
+
+            if (!currentSurveyId) surveyData.createdAt = common.updatedAt;
+            else {
+                const orig = surveys.find(s => s.docId === currentSurveyId);
+                if(orig) surveyData.createdAt = orig.createdAt;
+            }
+
+            if (isDemoMode) {
+                let newSurveys = [...surveys];
+                if (currentSurveyId) {
+                    const idx = newSurveys.findIndex(s => s.docId === currentSurveyId);
+                    if(idx !== -1) newSurveys[idx] = { ...newSurveys[idx], ...surveyData };
+                } else {
+                    surveyData.docId = 'loc_' + Date.now();
+                    newSurveys.push(surveyData);
+                }
+                localStorage.setItem('survey_data_prod', JSON.stringify(newSurveys));
+                setupRealtimeListener();
+            } else {
+                // Use standard collection for production
+                let ref = collection(db, 'surveys');
+                
+                if(currentSurveyId) await setDoc(doc(ref, currentSurveyId), surveyData, { merge: true });
+                else await setDoc(doc(ref), surveyData);
+            }
+            renderDashboardData();
+        }
+
+        // --- Helper Functions ---
+        function renderDashboardShell() {
+            const boxesContainer = document.getElementById('province-boxes');
+            if(!boxesContainer) return;
+            boxesContainer.innerHTML = '';
+            TARGET_PROVINCES.forEach(prov => {
+                const div = document.createElement('div');
+                div.className = "bg-white p-4 rounded-xl shadow-sm border-l-4 border-gray-200 relative overflow-hidden";
+                div.innerHTML = `
+                    <div class="flex justify-between items-start">
+                        <div><span class="text-xs font-bold text-gray-300 uppercase tracking-widest">${prov.code}</span><h3 class="font-bold text-gray-400 truncate">${prov.name}</h3></div>
+                        <i class="fas fa-spinner fa-spin text-gray-200"></i>
+                    </div>
+                    <div class="mt-3"><span class="text-3xl font-bold text-gray-200">--</span></div>
+                `;
+                boxesContainer.appendChild(div);
+            });
+            const tbody = document.getElementById('survey-table-body');
+            if(tbody) tbody.innerHTML = `<tr><td colspan="6" class="p-8 text-center text-gray-400"><i class="fas fa-circle-notch fa-spin mr-2"></i> Connecting...</td></tr>`;
+        }
+
+        window.filterTableByProvince = function(provName) {
+            const filtered = surveys.filter(s => s.province === provName);
+            renderTable(filtered);
+        }
+
+        window.deleteSurvey = async function(docId) {
+            if (confirm("Are you sure?")) {
+                if (isDemoMode) {
+                    const newSurveys = surveys.filter(s => s.docId !== docId);
+                    localStorage.setItem('survey_data_prod', JSON.stringify(newSurveys));
+                    surveys = newSurveys;
+                    renderDashboardData();
+                } else {
+                    try {
+                        await deleteDoc(doc(db, 'surveys', docId));
+                    } catch (e) { alert("Error deleting: " + e.message); }
+                }
+            }
+        }
+
+        window.handleProvinceChange = function(sel) {
+            const idEl = document.getElementById('display-id');
+            if(sel.value && !currentSurveyId) {
+                idEl.textContent = generateId(sel.value, currentSurveyType);
+            }
+        }
+        
+        function setVal(id, val) { const el = document.getElementById(id); if(el) el.value = val || ''; }
+        function checkRadio(name, val) { const el = document.querySelector(`input[name="${name}"][value="${val}"]`); if (el) el.checked = true; }
+        function checkBoxes(name, vals) {
+            document.querySelectorAll(`input[name="${name}"]`).forEach(el => el.checked = false);
+            if (Array.isArray(vals)) {
+                vals.forEach(v => { const el = document.querySelector(`input[name="${name}"][value="${v}"]`); if (el) el.checked = true; });
+            }
+        }
+        function getCB(name) { return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(c => c.value); }
+
+        window.addRow = function(bodyId, data = {}, readOnly = false) {
+            const body = document.getElementById(bodyId);
+            const row = document.createElement('tr');
+            row.innerHTML = `<td><input class="w-full p-1 border" value="${data.category||''}"/></td><td><input class="w-full p-1 border" value="${data.brands||''}"/></td>`;
+            body.appendChild(row);
+        }
+        function harvestTable(bodyId, keys) {
+            return Array.from(document.querySelectorAll(`#${bodyId} tr`)).map(tr => {
+                const inputs = tr.querySelectorAll('input');
+                let obj = {};
+                keys.forEach((k, i) => obj[k] = inputs[i] ? inputs[i].value : '');
+                return obj;
+            });
+        }
+
+        window.addOtherCatRow = function(catName, data={}, readOnly=false) {
+            const b = document.getElementById('other-cats-body');
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="border p-2 bg-gray-50 text-xs font-bold"><input type="hidden" value="${catName}">${catName}</td>
+                <td class="border p-1"><input class="w-full" name="qty" type="number" value="${data.qty||''}"></td>
+                <td class="border p-1"><input class="w-full" name="unit" value="${data.unit||''}"></td>
+                <td class="border p-1"><input class="w-full" name="price" value="${data.price||''}"></td>
+                <td class="border p-1"><input class="w-full" name="freq" placeholder="Daily/Weekly" value="${data.freq||''}"></td>
+                <td class="border p-1"><input class="w-full" name="retail" value="${data.retailPrice||''}"></td>
+                <td class="border p-1"><select class="w-full text-xs"><option>Self</option><option>Sales</option></select></td>
+            `;
+            b.appendChild(tr);
+        }
+
+        window.addBestSellerRow = function(rank, data={}, readOnly=false) {
+            const b = document.getElementById('top-sellers-body');
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="border p-2 bg-gray-50 font-bold text-xs"><input type="hidden" value="${rank}">${rank}</td>
+                <td class="border p-1"><input class="w-full" value="${data.cat||''}"></td>
+                <td class="border p-1"><input class="w-full" value="${data.brand||''}"></td>
+                <td class="border p-1"><input class="w-full" value="${data.flavor||''}"></td>
+                <td class="border p-1"><input class="w-full" value="${data.p18||''}"></td>
+                <td class="border p-1"><input class="w-full" value="${data.p32||''}"></td>
+                <td class="border p-1"><input class="w-full" value="${data.p50||''}"></td>
+            `;
+            b.appendChild(tr);
+        }
+
+        window.addFacingRow = function(brand, data={}, readOnly=false) {
+            const b = document.getElementById('facings-body');
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="border p-2 font-bold text-sm"><input type="hidden" value="${brand}">${brand}</td>
+                <td class="border p-1"><input class="w-full" type="number" value="${data.count||''}"></td>
+            `;
+            b.appendChild(tr);
+        }
+
+        window.addSupportRow = function(idx, data={}, readOnly=false) {
+            const b = document.getElementById('support-body');
+            const tr = document.createElement('tr');
+            const chk = (val) => val === 'on' ? 'checked' : '';
+            tr.innerHTML = `
+                <td class="border p-2 text-center">${idx}</td>
+                <td class="border p-1"><input class="w-full" value="${data.brand||''}" placeholder="Brand Name"></td>
+                <td class="border p-1 text-center"><input type="checkbox" ${chk(data.s_sample)}></td>
+                <td class="border p-1 text-center"><input type="checkbox" ${chk(data.s_promo)}></td>
+                <td class="border p-1 text-center"><input type="checkbox" ${chk(data.s_test)}></td>
+                <td class="border p-1 text-center"><input type="checkbox" ${chk(data.s_pop)}></td>
+                <td class="border p-1 text-center"><input type="checkbox" ${chk(data.s_rack)}></td>
+            `;
+            b.appendChild(tr);
+        }
+
+        function harvestRetailerTable(bodyId, keys) {
+            return Array.from(document.querySelectorAll(`#${bodyId} tr`)).map(tr => {
+                let obj = {};
+                const inputs = tr.querySelectorAll('input, select');
+                keys.forEach((k, i) => {
+                    const el = inputs[i];
+                    if (!el) return;
+                    if (el.type === 'checkbox') obj[k] = el.checked ? 'on' : 'off';
+                    else obj[k] = el.value;
+                });
+                return obj;
+            });
+        }
+
+        initApp();
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-800 h-screen flex flex-col">
+
+    <!-- Setup Modal -->
+    <div id="setup-modal" class="fixed inset-0 bg-black bg-opacity-80 z-50 flex items-center justify-center hidden">
+        <div class="bg-white p-8 rounded-lg shadow-2xl max-w-lg w-full relative">
+            <button onclick="document.getElementById('setup-modal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600"><i class="fas fa-times"></i></button>
+            <h2 class="text-2xl font-bold text-red-600 mb-4">⚠️ Setup Required</h2>
+            <p class="mb-4 text-gray-700">To sync data across devices, you must add your database keys.</p>
+            <ol class="list-decimal pl-5 mb-6 text-sm text-gray-600 space-y-2">
+                <li>Open <code>index.html</code> in a text editor.</li>
+                <li>Go to Line 23 and paste your <code>firebaseConfig</code> keys.</li>
+                <li>Save and refresh.</li>
+            </ol>
+            <p class="text-xs text-gray-400">Currently running in <strong>Local Demo Mode</strong>. Data will not sync.</p>
+        </div>
+    </div>
+
+    <!-- Survey Type Modal -->
+    <div id="type-modal" class="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center hidden">
+        <div class="bg-white p-8 rounded-xl shadow-2xl max-w-md w-full text-center">
+            <h2 class="text-2xl font-bold mb-6">Select Survey Type</h2>
+            <div class="grid grid-cols-2 gap-4">
+                <button onclick="startNewSurvey('CONSUMER')" class="p-6 border-2 border-blue-100 hover:border-blue-500 hover:bg-blue-50 rounded-xl transition">
+                    <i class="fas fa-user text-4xl text-blue-500 mb-2"></i>
+                    <div class="font-bold">Consumer</div>
+                    <div class="text-xs text-gray-500">Part 1</div>
+                </button>
+                <button onclick="startNewSurvey('RETAILER')" class="p-6 border-2 border-purple-100 hover:border-purple-500 hover:bg-purple-50 rounded-xl transition">
+                    <i class="fas fa-store text-4xl text-purple-500 mb-2"></i>
+                    <div class="font-bold">Retailer</div>
+                    <div class="text-xs text-gray-500">Part 2</div>
+                </button>
+            </div>
+            <button onclick="document.getElementById('type-modal').classList.add('hidden')" class="mt-6 text-gray-400 hover:text-gray-600 text-sm">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header class="bg-white border-b px-6 py-3 flex justify-between items-center shadow-sm z-20">
+        <h1 class="text-xl font-bold flex items-center gap-2"><i class="fas fa-database text-blue-600"></i> Data Center</h1>
+        <div class="flex gap-2 relative">
+            <div class="relative">
+                <button onclick="toggleExportMenu()" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg shadow text-sm font-bold"><i class="fas fa-download mr-2"></i> Export</button>
+                <div id="export-menu" class="hidden absolute right-0 mt-2 w-48 bg-white border rounded-lg shadow-xl z-50">
+                    <a onclick="exportData('SUMMARY')" class="block px-4 py-2 hover:bg-gray-100 cursor-pointer text-sm">Summary Report (Counts)</a>
+                    <a onclick="exportData('CONSUMER')" class="block px-4 py-2 hover:bg-gray-100 cursor-pointer text-sm">Consumer Data (CSV)</a>
+                    <a onclick="exportData('RETAILER')" class="block px-4 py-2 hover:bg-gray-100 cursor-pointer text-sm">Retailer Data (CSV)</a>
+                </div>
+            </div>
+            <button onclick="showTypeSelection()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg shadow text-sm font-bold"><i class="fas fa-plus mr-2"></i> New Survey</button>
+        </div>
+    </header>
+
+    <!-- DASHBOARD -->
+    <div id="dashboard-view" class="flex-1 overflow-y-auto p-6">
+        <div id="province-boxes" class="grid grid-cols-2 md:grid-cols-7 gap-3 mb-6"></div>
+        <div class="bg-white rounded-xl shadow overflow-hidden">
+            <div class="p-4 border-b bg-gray-50 flex justify-between items-center">
+                <h3 class="font-bold text-gray-600">All Records</h3>
+                <span class="text-xs bg-gray-200 px-2 py-1 rounded">Total: <span id="total-surveys">0</span></span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead class="bg-gray-100 text-gray-500 uppercase text-xs">
+                        <tr><th class="p-3">ID</th><th class="p-3">Type</th><th class="p-3">Province</th><th class="p-3">Interviewer/Store</th><th class="p-3">Date</th><th class="p-3">Actions</th></tr>
+                    </thead>
+                    <tbody id="survey-table-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- FORM CONTAINER -->
+    <div id="form-view" class="hidden flex-1 flex flex-col overflow-hidden bg-gray-100">
+        <div class="bg-white p-4 shadow flex justify-between items-center">
+            <div>
+                <h2 id="form-title" class="font-bold text-lg">Survey</h2>
+                <div class="text-xs text-gray-400">ID: <span id="display-id" class="font-mono text-black font-bold">---</span></div>
+            </div>
+            <div class="flex gap-2">
+                <button id="btn-save" onclick="saveSurvey(event)" class="bg-green-500 text-white px-6 py-2 rounded font-bold">Save</button>
+                <button onclick="renderDashboardData()" class="bg-gray-500 text-white px-4 py-2 rounded">Close</button>
+            </div>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-4 md:p-8">
+            
+            <!-- CONSUMER FORM (Part 1) -->
+            <div id="consumer-form" class="max-w-4xl mx-auto hidden">
+                <form id="consumer-form-content" class="space-y-6">
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="bg-blue-500 text-white px-4 py-1 -mx-6 -mt-6 rounded-t-lg mb-4 font-bold">I. Screener (Consumer)</div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div><label class="block text-xs font-bold uppercase">Province</label>
+                            <select name="province" id="province" onchange="handleProvinceChange(this)" class="w-full border p-2 rounded"><option value="">Select...</option><option>Battambang</option><option>Siem Reap</option><option>Kampong Cham</option><option>Prey Veng</option><option>Kampot</option><option>Phnom Penh</option><option>Kandal</option></select></div>
+                            <div><label class="block text-xs font-bold uppercase">Interviewer</label><input name="interviewer" class="w-full border p-2 rounded"></div>
+                        </div>
+                        <div class="mt-4"><label class="block text-sm font-bold">Purchased Savory Snack (Past 3 months)?</label><select name="purchasedPast3Months" class="w-full border p-2 rounded"><option>Yes</option><option>No</option></select></div>
+                    </div>
+                    
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="bg-blue-500 text-white px-4 py-1 -mx-6 -mt-6 rounded-t-lg mb-4 font-bold">IV. Brands</div>
+                        <table class="w-full border text-sm">
+                            <thead><tr><th class="border p-2">Category</th><th class="border p-2">Brands</th><th class="border p-2 w-8"><button type="button" onclick="addRow('top-brands-body')" class="text-blue-600">+</button></th></tr></thead>
+                            <tbody id="top-brands-body"></tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="bg-blue-500 text-white px-4 py-1 -mx-6 -mt-6 rounded-t-lg mb-4 font-bold">Top Products</div>
+                        <table class="w-full border text-sm">
+                            <thead><tr><th class="border p-2">Rank</th><th class="border p-2">Category</th><th class="border p-2">Brand</th><th class="border p-2">Flavor</th><th class="border p-2">Price</th></tr></thead>
+                            <tbody id="top-products-body"></tbody>
+                        </table>
+                    </div>
+                </form>
+            </div>
+
+            <!-- RETAILER FORM (Part 2) -->
+            <div id="retailer-form" class="max-w-4xl mx-auto hidden">
+                <form id="retailer-form-content" class="space-y-6">
+                    
+                    <!-- SECTION I: Profile -->
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="bg-purple-600 text-white px-4 py-1 -mx-6 -mt-6 rounded-t-lg mb-4 font-bold">I. Profile & Store</div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Province</label>
+                                <select name="r_province" id="r_province" onchange="handleProvinceChange(this)" class="w-full border p-2 rounded"><option value="">Select...</option><option>Battambang</option><option>Siem Reap</option><option>Kampong Cham</option><option>Prey Veng</option><option>Kampot</option><option>Phnom Penh</option><option>Kandal</option></select>
+                            </div>
+                            <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Store Name</label><input name="retailerName" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Pin Location</label><input name="pinLocation" class="w-full border p-2 rounded"></div>
+                            <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Store Type</label><select name="storeType" class="w-full border p-2 rounded"><option>Mom & Pop</option><option>Mini-mart</option><option>Convenience Store</option></select></div>
+                            <div>
+                                <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Owner/Manager?</label>
+                                <div class="flex gap-4"><label><input type="radio" name="isOwner" value="Yes"> Yes</label><label><input type="radio" name="isOwner" value="No"> No</label></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION II: Product Availability -->
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <h3 class="font-bold text-purple-700 mb-4">II. Product Availability</h3>
+                        <div class="overflow-x-auto mb-6">
+                            <table class="w-full border-collapse text-sm border">
+                                <thead class="bg-gray-100">
+                                    <tr><th class="border p-2 text-left">Category</th><th class="border p-2 w-16">Qty</th><th class="border p-2 w-16">Unit</th><th class="border p-2">Unit Price</th><th class="border p-2">Freq</th><th class="border p-2">Retail Price</th><th class="border p-2 w-20">Source</th></tr>
+                                </thead>
+                                <tbody id="other-cats-body"></tbody>
+                            </table>
+                        </div>
+
+                        <h4 class="font-bold text-sm mb-2">Top 3 Best Sellers</h4>
+                        <div class="overflow-x-auto">
+                            <table class="w-full border-collapse text-sm border">
+                                <thead class="bg-gray-100">
+                                    <tr><th class="border p-2 w-16">Rank</th><th class="border p-2">Category</th><th class="border p-2">Brand</th><th class="border p-2">Flavor</th><th class="border p-2">Price(18g)</th><th class="border p-2">Price(32g)</th><th class="border p-2">Price(50g)</th></tr>
+                                </thead>
+                                <tbody id="top-sellers-body"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- SECTION III: Pricing -->
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <h3 class="font-bold text-purple-700 mb-4">III. Pricing & Margin</h3>
+                        <div class="space-y-4">
+                            <div><label class="block text-sm font-bold mb-1">Best selling pack size?</label><div class="flex gap-4 text-sm"><label><input type="radio" name="packSize" value="Mini"> Mini (10-20g)</label><label><input type="radio" name="packSize" value="Small"> Small (30-55g)</label><label><input type="radio" name="packSize" value="Medium"> Medium (60-100g)</label></div></div>
+                            <div><label class="block text-sm font-bold mb-1">Typical Profit Margin (Riels)</label><div class="grid grid-cols-4 gap-2 text-sm"><label><input type="radio" name="profitMargin" value="200-300"> 200-300</label><label><input type="radio" name="profitMargin" value="400-600"> 400-600</label><label><input type="radio" name="profitMargin" value="700-900"> 700-900</label><label><input type="radio" name="profitMargin" value="1000+"> 1000+</label></div></div>
+                            <div><label class="block text-sm font-bold mb-1">Turnover (1 Carton)</label><select name="turnover" class="border p-1 rounded"><option>Less than 1 week</option><option>1-2 weeks</option><option>3-4 weeks</option><option>More than 1 month</option></select></div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION IV: Shelf Space & Support -->
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <h3 class="font-bold text-purple-700 mb-4">IV. Shelf Space & Brand Support</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <h4 class="font-bold text-sm mb-2">Shelf Facings</h4>
+                                <table class="w-full border text-sm">
+                                    <thead class="bg-gray-100"><tr><th class="border p-2">Brand</th><th class="border p-2">Facings</th></tr></thead>
+                                    <tbody id="facings-body"></tbody>
+                                </table>
+                            </div>
+                            <div>
+                                <h4 class="font-bold text-sm mb-2">Brand Support (Check all)</h4>
+                                <div class="overflow-x-auto">
+                                    <table class="w-full border text-xs">
+                                        <thead class="bg-gray-100"><tr><th class="border p-1">#</th><th class="border p-1">Brand</th><th class="border p-1">Sample</th><th class="border p-1">Promo</th><th class="border p-1">Test</th><th class="border p-1">POP</th><th class="border p-1">Rack</th></tr></thead>
+                                        <tbody id="support-body"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION V: Insights -->
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <h3 class="font-bold text-purple-700 mb-4">V. Retailer Insights</h3>
+                        <div class="space-y-4 text-sm">
+                            <div><label class="font-bold block mb-1">Why do customers choose brands?</label><div class="grid grid-cols-2 gap-2"><label><input type="checkbox" name="customerReasons" value="Cheap"> Price Cheap</label><label><input type="checkbox" name="customerReasons" value="Taste"> Good Taste</label><label><input type="checkbox" name="customerReasons" value="Packaging"> Nice Pack</label><label><input type="checkbox" name="customerReasons" value="Famous"> Famous</label></div></div>
+                            <div><label class="font-bold block mb-1">Challenges in selling?</label><div class="grid grid-cols-2 gap-2"><label><input type="checkbox" name="stockChallenges" value="LowMargin"> Low Margin</label><label><input type="checkbox" name="stockChallenges" value="Humidity"> Humidity</label><label><input type="checkbox" name="stockChallenges" value="Competition"> Competition</label><label><input type="checkbox" name="stockChallenges" value="Space"> No Space</label></div></div>
+                            <div><label class="font-bold block mb-1">Flavor Requests (Missing)</label><input name="newFlavorRequest" class="w-full border p-2 rounded"></div>
+                            <div><label class="font-bold block mb-1">Improvements Wanted</label><div class="grid grid-cols-2 gap-2"><label><input type="checkbox" name="improvements" value="Cheaper"> Cheaper</label><label><input type="checkbox" name="improvements" value="Flavor"> Better Flavor</label><label><input type="checkbox" name="improvements" value="Promo"> Promotions</label><label><input type="checkbox" name="improvements" value="Delivery"> Faster Delivery</label></div></div>
+                        </div>
+                    </div>
+
+                </form>
+            </div>
+
+        </div>
+    </div>
+
+</body>
+</html>
